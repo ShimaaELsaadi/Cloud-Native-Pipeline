@@ -28,7 +28,7 @@ module "compute" {
     }
     k3s-worker = {
       instance_type = "t2.micro"
-      subnet_id     = module.network.subnet_ids["subnet1"]  
+      subnet_id     = module.network.subnet_ids["subnet2"]  
       key_pair_name = "instance-key-pair"
       Role          = "worker"
 
