@@ -1,0 +1,12 @@
+all:
+  children:
+    controlplane:
+      hosts:
+        control-node:
+          ansible_host: <control_node_ip>
+          ansible_user: ubuntu
+    worker:
+      hosts:
+        worker-node:
+          ansible_host: <worker_node_ip>
+          ansible_user: ubuntu

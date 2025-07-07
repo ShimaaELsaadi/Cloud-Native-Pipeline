@@ -1,0 +1,246 @@
+stages:
+- Prepare infrastructure
+- setup k3s cluster
+- Build
+- test
+- Dependency Scanning
+- Dockerize and Container Scanning
+- Push
+- Deploy
+- verify
+
+include:
+- template: Security/SAST.gitlab-ci.yml
+variables:
+  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+  AWS_REGION: "us-west-2"
+  Docker_Image_name: "Java_Spring_Boota_pplication"
+  Image_Tag: "$CI_PIPELINE_IID"
+  SKIP_DEPLOY: "false"
+default:
+  tags:
+  - self
+#-------------------------------------------------------
+prepare-infra:
+  image: zenika/terraform-aws-cli:release-8.0_terraform-0.15.5_awscli-2.14.5
+  stage: Prepare infrastructure
+  before_script:
+  - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+  - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+  - cd infrastructure/terraform/envs/prod
+  script:
+  - terraform init
+  - terraform fmt
+  - terraform validate
+  - terraform apply -auto-approve
+  - touch tf_outputs.json
+  - terraform output -json > tf_outputs.json
+  artifacts:
+    paths:
+    - infrastructure/terraform/envs/prod/tf_outputs.json
+    expire_in: 1 hour
+#--------------------------------------------------------------------------   
+Setup-K3s:
+  stage: setup k3s cluster
+  image: python:3.14.0b3-slim
+  before_script:
+  - >-
+    apt-get update && apt-get install -y  gcc build-essential libffi-dev  python3-dev jq curl openssh-client
+  - pip install --upgrade pip
+  - pip install ansible boto3
+  - >-
+    curl -L --header "PRIVATE-TOKEN: $CI_JOB_TOKEN" "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/secure_files" -o /tmp/secure-files-list.json
+  script:
+  - export CONTROL_IP=$(jq -r '.k3s_controlplane_ip.value' infrastructure/terraform/envs/prod/tf_outputs.json)
+  - export WORKER_IP=$(jq -r '.k3s_worker_ip.value' infrastructure/terraform/envs/prod/tf_outputs.json)
+  - export PRIV_CONTROL_IP=$(jq -r '.k3s_controlplane_private_ip.value' infrastructure/terraform/envs/prod/tf_outputs.json)
+  - export PRIV_WORKER_IP=$(jq -r '.k3s_worker_private_ip.value' infrastructure/terraform/envs/prod/tf_outputs.json)
+  - echo $CONTROL_IP
+  - echo $WORKER_IP
+  - cd ansible
+  - mkdir -p ~/.ssh
+  - mv .ssh/instance-key-pair.pem ~/.ssh/id_rsa_k3s.pem
+  - chmod 600 ~/.ssh/id_rsa_k3s.pem
+  - ssh-keyscan -H "$CONTROL_IP" >> ~/.ssh/known_hosts
+  - ssh-keyscan -H "$WORKER_IP" >> ~/.ssh/known_hosts
+  - ssh -i ~/.ssh/id_rsa_k3s.pem -T ubuntu@$CONTROL_IP
+  - |
+    cat > inventory.yml <<EOF
+    all:
+      vars:
+        k3s_server_url: "https://${PRIV_CONTROL_IP}:6443"
+      children:
+            controlplane:
+              hosts:
+                control-node:
+                  ansible_host: $CONTROL_IP
+                  ansible_user: ubuntu
+            worker:
+              hosts:
+                worker-node:
+                  ansible_host: $WORKER_IP
+                  ansible_user: ubuntu
+
+    EOF
+  - export ANSIBLE_CONFIG="ansible.cfg"
+  - ansible-playbook playbook.yml --skip-tags "gather_facts"
+  - ssh -i ~/.ssh/id_rsa_k3s.pem ubuntu@$CONTROL_IP 'sudo cat /etc/rancher/k3s/k3s.yaml' > k3s.yaml
+  - sed -i "s/127.0.0.1/$CONTROL_IP/g" k3s.yaml
+  dependencies:
+  - prepare-infra
+  artifacts:
+    paths:
+    - k3s.yaml
+    expire_in: 1 hour
+
+#-----------------------------------------------------------------------------
+build-job:
+  image: maven:latest
+  stage: Build
+  script:
+  - echo "----------- build started ----------"
+  - mvn clean install -Dmaven.test.skip=true
+  - echo "----------- build complted ----------"
+  artifacts:
+    paths:
+    - target/
+    expire_in: 1 hour
+    when: always
+
+#-------------------------------------------------------------
+test-job:
+  image: maven:latest
+  stage: test
+  dependencies:
+  - build-job
+  script:
+  - echo "-------Running unit tests-------"
+  - mvn test -DskipCompile
+  - echo "-------Running SAST test-------"
+#-------------------------------------------------------------------------
+dependency-scanning-job:
+  stage: Dependency Scanning
+  variables:
+    TRIVY_CACHE_DIR: ".trivycache/"
+  before_script:
+  - chmod +x install.sh
+  - ./install.sh
+  script:
+  - touch misc-scan-report.json
+  - ./trivy filesystem --scanners config,vuln --exit-code 0 --format template --template "@contrib/gitlab-codequality.tpl" -o misc-scan-report.json .
+  - cat misc-scan-report.json
+  cache:
+    paths:
+    - .trivycache/
+  artifacts:
+    paths:
+    - misc-scan-report.json
+    reports:
+      codequality: misc-scan-report.json
+    expire_in: 1 hour
+    when: always
+
+#--------------------------------------------------------------------------------------------------
+Dockerize-container-scanning-job:
+  stage: Dockerize and Container Scanning
+  variables:
+    TRIVY_CACHE_DIR: ".trivycache/"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  tags:
+  - docker
+  services:
+  - docker:dind
+  dependencies:
+  - build-job
+  before_script:
+  - apk add --no-cache curl grep sed tar
+  - TRIVY_VERSION=$(curl -sL https://api.github.com/repos/aquasecurity/trivy/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+  - curl -L https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz | tar -zxvf -
+  - docker --version
+  script:
+  - echo "----- Building Docker image for scanning -----"
+  - touch container-scan-report.json
+  - docker build -t "$Docker_Image_name:$Image_Tag" .
+  - echo "----- Scanning Docker image with Trivy -----"
+  - export TRIVY_TIMEOUT=15m
+  - ./trivy image --exit-code 0 --format table "$Docker_Image_name:$Image_Tag" > container-scan-report.json
+  cache:
+    paths:
+    - .trivycache/
+  artifacts:
+    paths:
+    - container-scan-report.json
+    reports:
+      codequality: container-scan-report.json
+    expire_in: 1 hour
+    when: always
+#--------------------------------------------------------------------------
+Push-image:
+  stage: Push
+  dependencies:
+  - build-job
+  services:
+  - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+  - apk add --no-cache docker curl
+  - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+  - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+  - aws configure set default.region $AWS_REGION
+  script:
+  - export ECR_REPO_URL=$(jq -r '.ecr_repository_url.value' infrastructure/terraform/envs/prod/tf_outputs.json)
+  - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO_URL
+  - echo "----- Deploy Docker image----------"
+  - docker build -t $ECR_REPO_URL:$Docker_Image_name:$Image_Tag.
+  - docker push $ECR_REPO_URL:$Docker_Image_name:$Image_Tag
+
+#-----------------------------------------------------------------------------
+deploy:
+  stage: Deploy
+  image: bitnami/kubectl:latest
+  tags:
+  - docker
+  services:
+  - docker:dind
+  dependencies:
+  - Push-image
+  - Setup-K3s
+  before_script:
+  - kubectl --kubeconfig=./k3s.yaml get nodes
+  - export KUBECONFIG=k3s.yaml
+  - cd k8s
+  script:
+  - kubectl get nodes
+  - kubectl apply -f deployment.yaml
+  - kubectl apply -f service.yaml
+#-------------------------------------------------------------------------------
+dast-job:
+  stage: verify
+  tags:
+  - docker
+  services:
+  - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+  - docker run  -d -p 5050:8080 "$CI_REPO_USR/$Docker_Image_name:$Image_Tag"
+  - apk update
+  - apk add wget bash openjdk17 tar
+  - wget https://github.com/zaproxy/zaproxy/releases/download/v2.16.0/ZAP_2.16.0_Linux.tar.gz
+  - mkdir zap
+  - tar -xvf ZAP_2.16.0_Linux.tar.gz -C zap --strip-components=1
+  script:
+  - export CONTROL_IP=$(jq -r '.k3s_controlplane_ip.value' infrastructure/terraform/envs/prod/tf_outputs.json)
+  - cd zap
+  - bash ./zap.sh -cmd -quickurl http:$CONTROL_IP//:5050 -quickprogress -quickout ../Dast-report.html
+  artifacts:
+    paths:
+    - Dast-report.html
+    expire_in: 1 hour
+    when: always
+  dependencies:
+  - prepare-infra
+  - deploy

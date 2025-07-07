@@ -1,0 +1,9 @@
+- name: Install K3s agent
+  become: true
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    K3S_URL="{{ k3s_server_url }}"  \
+    K3S_TOKEN="{{ k3s_token }}" sh -
+  args:
+    executable: /bin/bash
+    creates: /etc/systemd/system/k3s-agent.service
